@@ -34,6 +34,9 @@
 #include "guild.h"
 #include "groups.h"
 #include "town.h"
+#include <memory>
+#include <vector>
+#include <map>
 
 #include <bitset>
 
@@ -76,7 +79,7 @@ struct VIPEntry {
 };
 
 struct OpenContainer {
-	Container* container;
+	Container* container; // Revert to raw pointer
 	uint16_t index;
 };
 
@@ -100,8 +103,42 @@ using MuteCountMap = std::map<uint32_t, uint32_t>;
 static constexpr int32_t PLAYER_MAX_SPEED = 1500;
 static constexpr int32_t PLAYER_MIN_SPEED = 10;
 
-class Player final : public Creature, public Cylinder
-{
+
+class Player final : public Creature, public Cylinder {
+private:
+	class ItemPool {
+	private:
+		std::vector<std::unique_ptr<Item>> pool;
+		size_t index = 0;
+	public:
+		ItemPool(size_t size) {
+			pool.reserve(size);
+			for (size_t i = 0; i < size; ++i) {
+				pool.emplace_back(std::make_unique<Item>(0));
+			}
+		}
+		Item* acquire(uint16_t itemId, uint8_t count = 1) {
+			if (index < pool.size()) {
+				Item* item = pool[index++].get();
+				item->setID(itemId);
+				item->setItemCount(count);
+				return item;
+			}
+			return new Item(itemId, count);
+		}
+		void release(Item* item) {
+			item->reset();
+			if (index > 0 && index <= pool.size()) {
+				pool[--index].reset(item);
+			}
+			else {
+				delete item;
+			}
+		}
+		~ItemPool() = default;
+	};
+	static ItemPool itemPool;
+
 	public:
 		explicit Player(ProtocolGame_ptr p);
 		~Player();
@@ -1071,9 +1108,10 @@ class Player final : public Creature, public Cylinder
 		std::unordered_set<uint32_t> VIPList;
 
 		std::map<uint8_t, OpenContainer> openContainers;
-		std::map<uint32_t, DepotLocker_ptr> depotLockerMap;
-		std::map<uint32_t, DepotChest*> depotChests;
 		std::map<uint32_t, int32_t> storageMap;
+		std::unique_ptr<Item> inventory[CONST_SLOT_LAST + 1] = {};
+		std::map<uint32_t, std::unique_ptr<DepotChest>> depotChests;
+		std::map<uint32_t, std::unique_ptr<DepotLocker>> depotLockerMap;
 
 		std::vector<OutfitEntry> outfits;
 		GuildWarVector guildWarVector;
@@ -1113,7 +1151,6 @@ class Player final : public Creature, public Cylinder
 		GuildRank_ptr guildRank = nullptr;
 		Group* group = nullptr;
 		Item* tradeItem = nullptr;
- 		Item* inventory[CONST_SLOT_LAST + 1] = {};
 		Item* writeItem = nullptr;
 		House* editHouse = nullptr;
 		Npc* shopOwner = nullptr;

@@ -18,140 +18,65 @@
  */
 
 #include "otpch.h"
+
 #include "outputmessage.h"
 #include "protocol.h"
 #include "lockfree.h"
 #include "scheduler.h"
-#include <algorithm>
-#include <iostream>
 
 extern Scheduler g_scheduler;
 
 namespace {
 
-	const uint16_t OUTPUTMESSAGE_FREE_LIST_CAPACITY = 4096; // Increased from 2048 for higher load
-	const std::chrono::milliseconds OUTPUTMESSAGE_AUTOSEND_DELAY{ 10 };
-	const size_t MAX_PROTOCOLS = 10000; // Arbitrary limit to prevent unbounded growth
+const uint16_t OUTPUTMESSAGE_FREE_LIST_CAPACITY = 2048;
+const std::chrono::milliseconds OUTPUTMESSAGE_AUTOSEND_DELAY {10};
 
-	void sendAll(std::vector<Protocol_ptr>& bufferedProtocols); // Pass by reference to avoid copying
+void sendAll(const std::vector<Protocol_ptr>& bufferedProtocols);
 
-	void scheduleSendAll(std::vector<Protocol_ptr>& bufferedProtocols) {
-		g_scheduler.addEvent(createSchedulerTask(OUTPUTMESSAGE_AUTOSEND_DELAY.count(),
-			[&bufferedProtocols]() { sendAll(bufferedProtocols); }));
-	}
+void scheduleSendAll(const std::vector<Protocol_ptr>& bufferedProtocols)
+{
+	g_scheduler.addEvent(createSchedulerTask(OUTPUTMESSAGE_AUTOSEND_DELAY.count(), [&]() { sendAll(bufferedProtocols); }));
+}
 
-	void sendAll(std::vector<Protocol_ptr>& bufferedProtocols) {
-		// Dispatcher thread
-		if (bufferedProtocols.empty()) return;
-
-		// Process in batches to improve cache locality
-		constexpr size_t BATCH_SIZE = 64;
-		for (size_t i = 0; i < bufferedProtocols.size(); i += BATCH_SIZE) {
-			size_t end = std::min(i + BATCH_SIZE, bufferedProtocols.size());
-			for (size_t j = i; j < end; ++j) {
-				auto& protocol = bufferedProtocols[j];
-				if (!protocol) {
-#ifdef _DEBUG
-					std::cerr << "OutputMessagePool::sendAll: Null protocol detected" << std::endl;
-#endif
-					continue;
-				}
-				auto msg = protocol->getCurrentBuffer();
-				if (msg) {
-					protocol->send(std::move(msg));
-				}
-			}
-		}
-
-		// Only reschedule if there are still protocols with pending messages
-		bool hasPending = false;
-		for (const auto& protocol : bufferedProtocols) {
-			if (protocol && protocol->getCurrentBuffer()) {
-				hasPending = true;
-				break;
-			}
-		}
-		if (hasPending) {
-			scheduleSendAll(bufferedProtocols);
+void sendAll(const std::vector<Protocol_ptr>& bufferedProtocols)
+{
+	//dispatcher thread
+	for (auto& protocol : bufferedProtocols) {
+		auto& msg = protocol->getCurrentBuffer();
+		if (msg) {
+			protocol->send(std::move(msg));
 		}
 	}
+
+	if (!bufferedProtocols.empty()) {
+		scheduleSendAll(bufferedProtocols);
+	}
+}
 
 }
 
-class OutputMessagePool {
-public:
-	OutputMessagePool() {
-		bufferedProtocols.reserve(128); // Pre-reserve for typical server load
+void OutputMessagePool::addProtocolToAutosend(Protocol_ptr protocol)
+{
+	//dispatcher thread
+	if (bufferedProtocols.empty()) {
+		scheduleSendAll(bufferedProtocols);
 	}
+	bufferedProtocols.emplace_back(protocol);
+}
 
-	void addProtocolToAutosend(Protocol_ptr protocol) {
-		// Dispatcher thread
-		if (!protocol) {
-#ifdef _DEBUG
-			std::cerr << "OutputMessagePool::addProtocolToAutosend: Null protocol" << std::endl;
-#endif
-			return;
-		}
-
-		if (bufferedProtocols.size() >= MAX_PROTOCOLS) {
-#ifdef _DEBUG
-			std::cerr << "OutputMessagePool::addProtocolToAutosend: Protocol limit reached (" << MAX_PROTOCOLS << ")" << std::endl;
-#endif
-			return;
-		}
-
-		if (bufferedProtocols.empty()) {
-			scheduleSendAll(bufferedProtocols);
-		}
-		bufferedProtocols.push_back(std::move(protocol)); // Move to avoid copying
+void OutputMessagePool::removeProtocolFromAutosend(const Protocol_ptr& protocol)
+{
+	//dispatcher thread
+	auto it = std::find(bufferedProtocols.begin(), bufferedProtocols.end(), protocol);
+	if (it != bufferedProtocols.end()) {
+		std::swap(*it, bufferedProtocols.back());
+		bufferedProtocols.pop_back();
 	}
+}
 
-	void removeProtocolFromAutosend(const Protocol_ptr& protocol) {
-		// Dispatcher thread
-		if (!protocol) return;
-
-		auto it = std::find(bufferedProtocols.begin(), bufferedProtocols.end(), protocol);
-		if (it != bufferedProtocols.end()) {
-			std::swap(*it, bufferedProtocols.back());
-			bufferedProtocols.pop_back();
-		}
-		else {
-#ifdef _DEBUG
-			std::cerr << "OutputMessagePool::removeProtocolFromAutosend: Protocol not found" << std::endl;
-#endif
-		}
-	}
-
-	OutputMessage_ptr getOutputMessage() {
-		return std::allocate_shared<OutputMessage>(LockfreePoolingAllocator<void, OUTPUTMESSAGE_FREE_LIST_CAPACITY>());
-	}
-
-	// AI-specific: Prioritize sending for critical updates (e.g., creature AI actions)
-	void addProtocolToPrioritySend(Protocol_ptr protocol) {
-		if (!protocol) return;
-		auto msg = protocol->getCurrentBuffer();
-		if (msg) {
-			protocol->send(std::move(msg)); // Immediate send for priority
-		}
-		addProtocolToAutosend(std::move(protocol)); // Then add to regular autosend
-	}
-
-	// Batch creature updates for AI efficiency
-	void batchCreatureUpdates(const std::vector<Protocol_ptr>& protocols) {
-		if (bufferedProtocols.size() + protocols.size() > MAX_PROTOCOLS) {
-#ifdef _DEBUG
-			std::cerr << "OutputMessagePool::batchCreatureUpdates: Exceeds protocol limit" << std::endl;
-#endif
-			return;
-		}
-		if (bufferedProtocols.empty()) {
-			scheduleSendAll(bufferedProtocols);
-		}
-		bufferedProtocols.insert(bufferedProtocols.end(), protocols.begin(), protocols.end());
-	}
-
-private:
-	std::vector<Protocol_ptr> bufferedProtocols;
-};
-
-OutputMessagePool g_outputMessagePool; // Assuming singleton usage
+OutputMessage_ptr OutputMessagePool::getOutputMessage()
+{
+	// LockfreePoolingAllocator<void,...> will leave (void* allocate) ill-formed because
+	// of sizeof(T), so this guarantees that only one list will be initialized
+	return std::allocate_shared<OutputMessage>(LockfreePoolingAllocator<void, OUTPUTMESSAGE_FREE_LIST_CAPACITY>());
+}

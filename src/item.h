@@ -534,6 +534,16 @@ class Item : virtual public Thing
 		static Item* CreateItem(PropStream& propStream);
 		static Items items;
 
+		//reset
+		void reset() {
+			id = 0;
+			count = 0;
+			parent = nullptr;
+			attributes.reset();
+			referenceCounter = 0;
+			loadedFromMap = false;
+		}
+
 		// Constructor for items
 		Item(const uint16_t type, uint16_t count = 0);
 		Item(const Item& i);
@@ -1004,14 +1014,14 @@ class Item : virtual public Thing
 			return attributes;
 		}
 
-		void incrementReferenceCounter() {
-			++referenceCounter;
-		}
 		void decrementReferenceCounter() {
-			if (--referenceCounter == 0) {
-				delete this;
+			if (!isPooled()) { // Add check
+				if (--referenceCounter == 0) {
+					delete this;
+				}
 			}
 		}
+		bool isPooled() const { return false; } // Override in pooled items if needed
 
 		Cylinder* getParent() const override {
 			return parent;

@@ -35,14 +35,14 @@ ServiceManager::~ServiceManager()
 
 void ServiceManager::die()
 {
-	io_context.stop();
+	io_service.stop();
 }
 
 void ServiceManager::run()
 {
 	assert(!running);
 	running = true;
-	io_context.run();
+	io_service.run();
 }
 
 void ServiceManager::stop()
@@ -55,28 +55,16 @@ void ServiceManager::stop()
 
 	for (auto& servicePortIt : acceptors) {
 		try {
-			// Use boost::asio::post with lambda
-			boost::asio::post(io_context, [servicePortIt]() {
-				if (servicePortIt.second) {
-					servicePortIt.second->onStopServer();
-				}
-				});
-		}
-		catch (boost::system::system_error& e) {
+			io_service.post(std::bind(&ServicePort::onStopServer, servicePortIt.second));
+		} catch (boost::system::system_error& e) {
 			std::cout << "[ServiceManager::stop] Network Error: " << e.what() << std::endl;
 		}
 	}
 
 	acceptors.clear();
 
-	// Update to expires_after
-	death_timer.expires_after(std::chrono::seconds(3));
-	// Use lambda instead of std::bind
-	death_timer.async_wait([this](const boost::system::error_code& ec) {
-		if (!ec) {
-			die();
-		}
-		});
+	death_timer.expires_from_now(std::chrono::seconds(3));
+	death_timer.async_wait(std::bind(&ServiceManager::die, this));
 }
 
 ServicePort::~ServicePort()
@@ -106,20 +94,20 @@ std::string ServicePort::get_protocol_names() const
 
 void ServicePort::accept()
 {
-	auto connection = ConnectionManager::getInstance().createConnection(io_context, shared_from_this());
-	acceptor->async_accept(connection->socket(),
-		[this, connection](const boost::system::error_code& error) {
-			onAccept(connection, error);
-		});
+	if (!acceptor) {
+		return;
+	}
+
+	auto connection = ConnectionManager::getInstance().createConnection(io_service, shared_from_this());
+	acceptor->async_accept(connection->getSocket(), std::bind(&ServicePort::onAccept, shared_from_this(), connection, std::placeholders::_1));
 }
 
 void ServicePort::onAccept(Connection_ptr connection, const boost::system::error_code& error)
 {
-    // Implementation (e.g., handle new connection)
-    if (!error) {
-        // Process the connection
-    }
-}
+	if (!error) {
+		if (services.empty()) {
+			return;
+		}
 
 		auto remote_ip = connection->getIP();
 		if (remote_ip != 0 && g_bans.acceptConnection(remote_ip)) {
@@ -180,10 +168,10 @@ void ServicePort::open(uint16_t port)
 
 	try {
 		if (g_config.getBoolean(ConfigManager::BIND_ONLY_GLOBAL_ADDRESS)) {
-			acceptor.reset(new boost::asio::ip::tcp::acceptor(io_context, boost::asio::ip::tcp::endpoint(
-			            boost::asio::ip::address(boost::asio::ip::make_address_v4(g_config.getString(ConfigManager::IP_STRING))), serverPort)));
+			acceptor.reset(new boost::asio::ip::tcp::acceptor(io_service, boost::asio::ip::tcp::endpoint(
+			            boost::asio::ip::address(boost::asio::ip::address_v4::from_string(g_config.getString(ConfigManager::IP_STRING))), serverPort)));
 		} else {
-			acceptor.reset(new boost::asio::ip::tcp::acceptor(io_context, boost::asio::ip::tcp::endpoint(
+			acceptor.reset(new boost::asio::ip::tcp::acceptor(io_service, boost::asio::ip::tcp::endpoint(
 			            boost::asio::ip::address(boost::asio::ip::address_v4(INADDR_ANY)), serverPort)));
 		}
 

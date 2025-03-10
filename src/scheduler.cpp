@@ -18,154 +18,69 @@
  */
 
 #include "otpch.h"
+
 #include "scheduler.h"
 #include <boost/asio/post.hpp>
 #include <memory>
-#include <atomic>
-#include <iostream>
 
-extern Dispatcher g_dispatcher; // Assuming this is defined elsewhere
-
-class Scheduler {
-public:
-	Scheduler() {
-		eventIdTimerMap.reserve(1024); // Pre-reserve for typical load
+uint32_t Scheduler::addEvent(SchedulerTask* task)
+{
+	// check if the event has a valid id
+	if (task->getEventId() == 0) {
+		task->setEventId(++lastEventId);
 	}
 
-	uint32_t addEvent(SchedulerTask* task) {
-		if (!task) {
-#ifdef _DEBUG
-			std::cerr << "Scheduler::addEvent: Null task provided" << std::endl;
-#endif
-			return 0;
-		}
+	boost::asio::post(io_context, [this, task]() {
+		// insert the event id in the list of active events
+		auto it = eventIdTimerMap.emplace(task->getEventId(), boost::asio::steady_timer{io_context});
+		auto& timer = it.first->second;
 
-		if (task->getEventId() == 0) {
-			task->setEventId(++lastEventId);
-		}
+		timer.expires_from_now(std::chrono::milliseconds(task->getDelay()));
+		timer.async_wait([this, task](const boost::system::error_code& error) {
+			eventIdTimerMap.erase(task->getEventId());
 
-		boost::asio::post(io_context, [this, task]() {
-			if (getState() == THREAD_STATE_TERMINATED) {
+			if (error == boost::asio::error::operation_aborted || getState() == THREAD_STATE_TERMINATED) {
+				// the timer has been manually canceled(timer->cancel()) or Scheduler::shutdown has been called
 				delete task;
 				return;
 			}
 
-			auto eventId = task->getEventId();
-			auto [it, inserted] = eventIdTimerMap.emplace(eventId, boost::asio::steady_timer{ io_context });
-			if (!inserted) {
-#ifdef _DEBUG
-				std::cerr << "Scheduler::addEvent: Duplicate event ID " << eventId << std::endl;
-#endif
-				delete task;
-				return;
-			}
+			g_dispatcher.addTask(task);
+		});
+	});
 
-			auto& timer = it->second;
-			timer.expires_after(std::chrono::milliseconds(task->getDelay()));
-			timer.async_wait([this, task](const boost::system::error_code& error) {
-				auto it = eventIdTimerMap.find(task->getEventId());
-				if (it != eventIdTimerMap.end()) {
-					eventIdTimerMap.erase(it); // Only erase if still present
-				}
+	return task->getEventId();
+}
 
-				if (error == boost::asio::error::operation_aborted || getState() == THREAD_STATE_TERMINATED) {
-					delete task;
-					return;
-				}
-
-				g_dispatcher.addTask(task);
-				});
-			});
-
-		return task->getEventId();
+void Scheduler::stopEvent(uint32_t eventId)
+{
+	if (eventId == 0) {
+		return;
 	}
 
-	bool stopEvent(uint32_t eventId) {
-		if (eventId == 0) return false;
-
-		bool success = false;
-		boost::asio::post(io_context, [this, eventId, &success]() {
-			auto it = eventIdTimerMap.find(eventId);
-			if (it != eventIdTimerMap.end()) {
-				it->second.cancel();
-				success = true;
-			}
-			else {
-#ifdef _DEBUG
-				std::cerr << "Scheduler::stopEvent: Event ID " << eventId << " not found" << std::endl;
-#endif
-			}
-			});
-		return success; // Note: This is optimistic; actual success may depend on async completion
-	}
-
-	void shutdown() {
-		state.store(THREAD_STATE_TERMINATED, std::memory_order_release);
-		boost::asio::post(io_context, [this]() {
-			for (auto& [eventId, timer] : eventIdTimerMap) {
-				timer.cancel();
-			}
-			eventIdTimerMap.clear(); // Ensure all timers are cleaned up
-			io_context.stop();
-			});
-	}
-
-	// AI-specific: Add prioritized event
-	uint32_t addPriorityEvent(SchedulerTask* task) {
-		task->setPriority(true); // Assuming SchedulerTask has a priority flag
-		return addEvent(task);
-	}
-
-	// AI-specific: Batch scheduling for creature updates
-	std::vector<uint32_t> addBatchEvents(std::vector<SchedulerTask*> tasks) {
-		std::vector<uint32_t> eventIds;
-		eventIds.reserve(tasks.size());
-
-		boost::asio::post(io_context, [this, tasks = std::move(tasks)]() {
-			for (auto* task : tasks) {
-				if (!task) continue;
-
-				if (task->getEventId() == 0) {
-					task->setEventId(++lastEventId);
-				}
-
-				auto eventId = task->getEventId();
-				auto& timer = eventIdTimerMap.emplace(eventId, boost::asio::steady_timer{ io_context }).first->second;
-				timer.expires_after(std::chrono::milliseconds(task->getDelay()));
-				timer.async_wait([this, task](const boost::system::error_code& error) {
-					auto it = eventIdTimerMap.find(task->getEventId());
-					if (it != eventIdTimerMap.end()) {
-						eventIdTimerMap.erase(it);
-					}
-
-					if (error == boost::asio::error::operation_aborted || getState() == THREAD_STATE_TERMINATED) {
-						delete task;
-						return;
-					}
-
-					g_dispatcher.addTask(task);
-					});
-			}
-			});
-
-		for (const auto* task : tasks) {
-			if (task) eventIds.push_back(task->getEventId());
+	boost::asio::post(io_context, [this, eventId]() {
+		// search the event id
+		auto it = eventIdTimerMap.find(eventId);
+		if (it != eventIdTimerMap.end()) {
+			it->second.cancel();
 		}
-		return eventIds;
-	}
+	});
+}
 
-	inline ThreadState getState() const { return state.load(std::memory_order_acquire); }
-	void setState(ThreadState newState) { state.store(newState, std::memory_order_release); }
+void Scheduler::shutdown()
+{
+	setState(THREAD_STATE_TERMINATED);
+	boost::asio::post(io_context, [this]() {
+		// cancel all active timers
+		for (auto& it : eventIdTimerMap) {
+			it.second.cancel();
+		}
 
-private:
-	boost::asio::io_context io_context;
-	std::unordered_map<uint32_t, boost::asio::steady_timer> eventIdTimerMap;
-	std::atomic<uint32_t> lastEventId{ 0 };
-	std::atomic<ThreadState> state{ THREAD_STATE_RUNNING };
-};
+		io_context.stop();
+	});
+}
 
-Scheduler g_scheduler; // Assuming singleton usage
-
-SchedulerTask* createSchedulerTask(uint32_t delay, TaskFunc&& f) {
+SchedulerTask* createSchedulerTask(uint32_t delay, TaskFunc&& f)
+{
 	return new SchedulerTask(delay, std::move(f));
 }

@@ -24,7 +24,6 @@
 #include "chat.h"
 #include "creature.h"
 #include "tasks.h"
-#include "enums.h"
 
 class NetworkMessage;
 class Player;
