@@ -286,6 +286,13 @@ class ItemAttributes
 				boost::apply_visitor(SerializeVisitor(propWriteStream), value);
 			}
 
+			class Item {
+				bool isPooled() const { return pooled; }
+				void setPooled(bool value) { pooled = value; }
+			private:
+				bool pooled = false;
+			};
+
 			bool unserialize(PropStream& propStream) {
 				// This is hard-coded so it's not general, depends on the position of the variants.
 				uint8_t pos;

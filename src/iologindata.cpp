@@ -222,9 +222,7 @@ bool IOLoginData::loadPlayer(Player* player, DBResult_ptr result)
 	player->setGUID(result->getNumber<uint32_t>("id"));
 	player->name = result->getString("name");
 	player->accountNumber = accno;
-
 	player->accountType = acc.accountType;
-
 	player->premiumEndsAt = acc.premiumEndsAt;
 
 	Group* group = g_game.groups.getGroup(result->getNumber<uint16_t>("group_id"));
@@ -240,38 +238,34 @@ bool IOLoginData::loadPlayer(Player* player, DBResult_ptr result)
 	player->level = std::max<uint32_t>(1, result->getNumber<uint32_t>("level"));
 
 	uint64_t experience = result->getNumber<uint64_t>("experience");
-
 	uint64_t currExpCount = Player::getExpForLevel(player->level);
 	uint64_t nextExpCount = Player::getExpForLevel(player->level + 1);
 	if (experience < currExpCount || experience > nextExpCount) {
 		experience = currExpCount;
 	}
-
 	player->experience = experience;
-
-	if (currExpCount < nextExpCount) {
-		player->levelPercent = Player::getPercentLevel(player->experience - currExpCount, nextExpCount - currExpCount);
-	} else {
-		player->levelPercent = 0;
-	}
+	player->levelPercent = (currExpCount < nextExpCount) ? Player::getPercentLevel(player->experience - currExpCount, nextExpCount - currExpCount) : 0;
 
 	player->soul = result->getNumber<uint16_t>("soul");
 	player->capacity = result->getNumber<uint32_t>("cap") * 100;
 	player->blessings = result->getNumber<uint16_t>("blessings");
 
+	// Load and apply conditions
 	unsigned long conditionsSize;
 	const char* conditions = result->getStream("conditions", conditionsSize);
 	PropStream propStream;
 	propStream.init(conditions, conditionsSize);
 
-	Condition* condition = Condition::createCondition(propStream);
+	std::vector<std::unique_ptr<Condition>> conditionsVec;
+	std::unique_ptr<Condition> condition(Condition::createCondition(propStream));
 	while (condition) {
 		if (condition->unserialize(propStream)) {
-			player->storedConditionList.push_front(condition);
-		} else {
-			delete condition;
+			conditionsVec.push_back(std::move(condition));
 		}
-		condition = Condition::createCondition(propStream);
+		condition = std::unique_ptr<Condition>(Condition::createCondition(propStream));
+	}
+	for (auto& cond : conditionsVec) {
+		player->addCondition(cond.release());
 	}
 
 	if (!player->setVocation(result->getNumber<uint16_t>("vocation"))) {
@@ -288,7 +282,6 @@ bool IOLoginData::loadPlayer(Player* player, DBResult_ptr result)
 	if (manaSpent > nextManaCount) {
 		manaSpent = 0;
 	}
-
 	player->manaSpent = manaSpent;
 	player->magLevelPercent = Player::getPercentLevel(player->manaSpent, nextManaCount);
 
@@ -302,18 +295,17 @@ bool IOLoginData::loadPlayer(Player* player, DBResult_ptr result)
 	player->defaultOutfit.lookFeet = result->getNumber<uint16_t>("lookfeet");
 	player->defaultOutfit.lookAddons = result->getNumber<uint16_t>("lookaddons");
 	player->currentOutfit = player->defaultOutfit;
-	player->direction = static_cast<Direction> (result->getNumber<uint16_t>("direction"));
+	player->direction = static_cast<Direction>(result->getNumber<uint16_t>("direction"));
 
 	if (g_game.getWorldType() != WORLD_TYPE_PVP_ENFORCED) {
 		const time_t skullSeconds = result->getNumber<time_t>("skulltime") - time(nullptr);
 		if (skullSeconds > 0) {
-			//ensure that we round up the number of ticks
 			player->skullTicks = (skullSeconds + 2);
-
 			uint16_t skull = result->getNumber<uint16_t>("skull");
 			if (skull == SKULL_RED) {
 				player->skull = SKULL_RED;
-			} else if (skull == SKULL_BLACK) {
+			}
+			else if (skull == SKULL_BLACK) {
 				player->skull = SKULL_BLACK;
 			}
 		}
@@ -331,7 +323,6 @@ bool IOLoginData::loadPlayer(Player* player, DBResult_ptr result)
 		std::cout << "[Error - IOLoginData::loadPlayer] " << player->name << " has Town ID " << result->getNumber<uint32_t>("town_id") << " which doesn't exist" << std::endl;
 		return false;
 	}
-
 	player->town = town;
 
 	const Position& loginPos = player->loginPosition;
@@ -341,8 +332,8 @@ bool IOLoginData::loadPlayer(Player* player, DBResult_ptr result)
 
 	player->staminaMinutes = result->getNumber<uint16_t>("stamina");
 
-	static const std::string skillNames[] = {"skill_fist", "skill_club", "skill_sword", "skill_axe", "skill_dist", "skill_shielding", "skill_fishing"};
-	static const std::string skillNameTries[] = {"skill_fist_tries", "skill_club_tries", "skill_sword_tries", "skill_axe_tries", "skill_dist_tries", "skill_shielding_tries", "skill_fishing_tries"};
+	static const std::string skillNames[] = { "skill_fist", "skill_club", "skill_sword", "skill_axe", "skill_dist", "skill_shielding", "skill_fishing" };
+	static const std::string skillNameTries[] = { "skill_fist_tries", "skill_club_tries", "skill_sword_tries", "skill_axe_tries", "skill_dist_tries", "skill_shielding_tries", "skill_fishing_tries" };
 	static constexpr size_t size = sizeof(skillNames) / sizeof(std::string);
 	for (uint8_t i = 0; i < size; ++i) {
 		uint16_t skillLevel = result->getNumber<uint16_t>(skillNames[i]);
@@ -351,7 +342,6 @@ bool IOLoginData::loadPlayer(Player* player, DBResult_ptr result)
 		if (skillTries > nextSkillTries) {
 			skillTries = 0;
 		}
-
 		player->skills[i].level = skillLevel;
 		player->skills[i].tries = skillTries;
 		player->skills[i].percent = Player::getPercentLevel(skillTries, nextSkillTries);
@@ -367,7 +357,8 @@ bool IOLoginData::loadPlayer(Player* player, DBResult_ptr result)
 			guild = IOGuild::loadGuild(guildId);
 			if (guild) {
 				g_game.addGuild(guild);
-			} else {
+			}
+			else {
 				std::cout << "[Warning - IOLoginData::loadPlayer] " << player->name << " has Guild ID " << guildId << " which doesn't exist" << std::endl;
 			}
 		}
@@ -379,15 +370,12 @@ bool IOLoginData::loadPlayer(Player* player, DBResult_ptr result)
 				if ((result = db.storeQuery(fmt::format("SELECT `id`, `name`, `level` FROM `guild_ranks` WHERE `id` = {:d}", playerRankId)))) {
 					guild->addRank(result->getNumber<uint32_t>("id"), result->getString("name"), result->getNumber<uint16_t>("level"));
 				}
-
 				rank = guild->getRankById(playerRankId);
 				if (!rank) {
 					player->guild = nullptr;
 				}
 			}
-
 			player->guildRank = rank;
-
 			IOGuild::getWarList(guildId, player->guildWarVector);
 
 			if ((result = db.storeQuery(fmt::format("SELECT COUNT(*) AS `members` FROM `guild_membership` WHERE `guild_id` = {:d}", guildId)))) {
@@ -402,24 +390,22 @@ bool IOLoginData::loadPlayer(Player* player, DBResult_ptr result)
 		} while (result->next());
 	}
 
-	//load inventory items
+	// Load inventory items
 	ItemMap itemMap;
-
 	if ((result = db.storeQuery(fmt::format("SELECT `pid`, `sid`, `itemtype`, `count`, `attributes` FROM `player_items` WHERE `player_id` = {:d} ORDER BY `sid` DESC", player->getGUID())))) {
-		loadItems(itemMap, result);
-
+		loadItems(player, itemMap, result);
 		for (ItemMap::const_reverse_iterator it = itemMap.rbegin(), end = itemMap.rend(); it != end; ++it) {
 			const std::pair<Item*, int32_t>& pair = it->second;
 			Item* item = pair.first;
 			int32_t pid = pair.second;
 			if (pid >= CONST_SLOT_FIRST && pid <= CONST_SLOT_LAST) {
 				player->internalAddThing(pid, item);
-			} else {
+			}
+			else {
 				ItemMap::const_iterator it2 = itemMap.find(pid);
 				if (it2 == itemMap.end()) {
 					continue;
 				}
-
 				Container* container = it2->second.first->getContainer();
 				if (container) {
 					container->internalAddThing(item);
@@ -428,28 +414,25 @@ bool IOLoginData::loadPlayer(Player* player, DBResult_ptr result)
 		}
 	}
 
-	//load depot locker items
+	// Load depot locker items
 	itemMap.clear();
-
 	if ((result = db.storeQuery(fmt::format("SELECT `pid`, `sid`, `itemtype`, `count`, `attributes` FROM `player_depotlockeritems` WHERE `player_id` = {:d} ORDER BY `sid` DESC", player->getGUID())))) {
-		loadItems(itemMap, result);
-
+		loadItems(player, itemMap, result);
 		for (ItemMap::const_reverse_iterator it = itemMap.rbegin(), end = itemMap.rend(); it != end; ++it) {
 			const std::pair<Item*, int32_t>& pair = it->second;
 			Item* item = pair.first;
-
 			int32_t pid = pair.second;
 			if (pid >= 0 && pid < 100) {
 				DepotLocker* depotLocker = player->getDepotLocker(pid);
 				if (depotLocker) {
 					depotLocker->internalAddThing(item);
 				}
-			} else {
+			}
+			else {
 				ItemMap::const_iterator it2 = itemMap.find(pid);
 				if (it2 == itemMap.end()) {
 					continue;
 				}
-
 				Container* container = it2->second.first->getContainer();
 				if (container) {
 					container->internalAddThing(item);
@@ -458,28 +441,25 @@ bool IOLoginData::loadPlayer(Player* player, DBResult_ptr result)
 		}
 	}
 
-	//load depot items
+	// Load depot items
 	itemMap.clear();
-
 	if ((result = db.storeQuery(fmt::format("SELECT `pid`, `sid`, `itemtype`, `count`, `attributes` FROM `player_depotitems` WHERE `player_id` = {:d} ORDER BY `sid` DESC", player->getGUID())))) {
-		loadItems(itemMap, result);
-
+		loadItems(player, itemMap, result);
 		for (ItemMap::const_reverse_iterator it = itemMap.rbegin(), end = itemMap.rend(); it != end; ++it) {
 			const std::pair<Item*, int32_t>& pair = it->second;
 			Item* item = pair.first;
-
 			int32_t pid = pair.second;
 			if (pid >= 0 && pid < 100) {
 				DepotChest* depotChest = player->getDepotChest(pid, true);
 				if (depotChest) {
 					depotChest->internalAddThing(item);
 				}
-			} else {
+			}
+			else {
 				ItemMap::const_iterator it2 = itemMap.find(pid);
 				if (it2 == itemMap.end()) {
 					continue;
 				}
-
 				Container* container = it2->second.first->getContainer();
 				if (container) {
 					container->internalAddThing(item);
@@ -488,14 +468,14 @@ bool IOLoginData::loadPlayer(Player* player, DBResult_ptr result)
 		}
 	}
 
-	//load storage map
+	// Load storage map
 	if ((result = db.storeQuery(fmt::format("SELECT `key`, `value` FROM `player_storage` WHERE `player_id` = {:d}", player->getGUID())))) {
 		do {
 			player->addStorageValue(result->getNumber<uint32_t>("key"), result->getNumber<int32_t>("value"), true);
 		} while (result->next());
 	}
 
-	//load vip list
+	// Load VIP list
 	if ((result = db.storeQuery(fmt::format("SELECT `player_id` FROM `account_viplist` WHERE `account_id` = {:d}", player->getAccount())))) {
 		do {
 			player->addVIPInternal(result->getNumber<uint32_t>("player_id"));
@@ -850,7 +830,7 @@ bool IOLoginData::formatPlayerName(std::string& name)
 	return true;
 }
 
-void IOLoginData::loadItems(ItemMap& itemMap, DBResult_ptr result)
+void IOLoginData::loadItems(Player* player, ItemMap& itemMap, DBResult_ptr result)
 {
 	do {
 		uint32_t sid = result->getNumber<uint32_t>("sid");
@@ -864,14 +844,15 @@ void IOLoginData::loadItems(ItemMap& itemMap, DBResult_ptr result)
 		PropStream propStream;
 		propStream.init(attr, attrSize);
 
-		Item* item = Item::CreateItem(type, count);
+		Item* item = player->itemPool.acquire(type, count);
 		if (item) {
 			if (!item->unserializeAttr(propStream)) {
-				std::cout << "WARNING: Serialize error in IOLoginData::loadItems" << std::endl;
+				std::cout << "WARNING: Serialize error in IOLoginData::loadItems for item ID " << type << std::endl;
 			}
-
-			std::pair<Item*, uint32_t> pair(item, pid);
-			itemMap[sid] = pair;
+			itemMap.emplace(sid, std::make_pair(item, pid));
+		}
+		else {
+			std::cout << "WARNING: Failed to acquire item ID " << type << " from ItemPool" << std::endl;
 		}
 	} while (result->next());
 }

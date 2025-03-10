@@ -1091,6 +1091,7 @@ private:
 
 		void updateThing(Thing* thing, uint16_t itemId, uint32_t count) override;
 		void replaceThing(uint32_t index, Thing* thing) override;
+		std::unique_ptr<Item> writeItem;
 
 		void removeThing(Thing* thing, uint32_t count) override;
 
@@ -1120,7 +1121,6 @@ private:
 
 		std::forward_list<Party*> invitePartyList;
 		std::forward_list<std::string> learnedInstantSpellList;
-		std::forward_list<Condition*> storedConditionList; // TODO: This variable is only temporarily used when logging in, get rid of it somehow
 
 		std::string name;
 		std::string guildNick;

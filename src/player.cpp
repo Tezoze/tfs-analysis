@@ -63,40 +63,32 @@ uint32_t Player::playerAutoID = 0x10000000;
 MuteCountMap Player::muteCountMap;
 ItemPool Player::itemPool(1000); // Initialize ItemPool with 1000 pre-allocated items
 
-Player::Player(ProtocolGame_ptr p) :
-	Creature(), client(std::move(p))
+Player::Player(ProtocolGame_ptr p) : Creature(), client(std::move(p))
 {
 	lastPing = OTSYS_TIME();
 	lastPong = lastPing;
-
-	// Pre-allocate collections
-	outfits.reserve(50); // Typical number of outfits per player
-	shopItemList.reserve(20); // Common shop item count
-	guildWarVector.reserve(10); // Reasonable war list size
-
-	// Default initialization
-	setVocation(0); // No vocation
+	outfits.reserve(50);
+	shopItemList.reserve(20);
+	guildWarVector.reserve(10);
+	attackedSet.reserve(g_config.getNumber(ConfigManager::MAX_PVP_ATTACKERS, 10));
+	VIPList.reserve(getMaxVIPEntries());
+	invitePartyList.reserve(g_config.getNumber(ConfigManager::MAX_PARTY_INVITES, 5));
+	setVocation(0);
 	updateBaseSpeed();
 	updateInventoryWeight();
 }
 
 Player::~Player()
 {
-	// No need to delete inventory, depotChests, depotLockerMap (handled by unique_ptr)
-	for (auto* condition : storedConditionList) {
-		condition->endCondition(this);
-		condition->deleteCondition();
-	}
-
 	if (tradeItem) {
-		g_game.internalCloseTrade(this); // Let Game handle tradeItem cleanup
+		g_game.internalCloseTrade(this);
 	}
-
-	// Cleanup party and guild references
 	if (party) {
 		party->removeMember(this);
 	}
 	setGuild(nullptr);
+	setEditHouse(nullptr);
+	// writeItem handled by unique_ptr
 }
 
 bool Player::setVocation(uint16_t vocId)
@@ -124,33 +116,25 @@ Item* Player::ItemPool::acquire(uint16_t itemId, uint8_t count) {
 		Item* item = pool[index++].get();
 		item->setID(itemId);
 		item->setItemCount(count);
+		item->setPooled(true);
 		return item;
 	}
-	std::cout << "Warning: ItemPool exhausted, allocating new Item" << std::endl;
-	return new Item(itemId, count);
+	std::cout << "Warning: ItemPool exhausted, expanding pool" << std::endl;
+	pool.emplace_back(std::make_unique<Item>(itemId, count));
+	Item* item = pool.back().get();
+	item->setPooled(true);
+	index++;
+	return item;
 }
 
 void Player::ItemPool::release(Item* item) {
 	item->reset();
-	if (index > 0) {
+	if (item->isPooled() && index > 0) {
 		pool[--index] = std::unique_ptr<Item>(item);
 	}
-}
-
-// Remove duplicate Player::Player and Player::~Player definitions
-Player::Player(ProtocolGame_ptr p) : Creature(), lastPing(OTSYS_TIME()), lastPong(lastPing), client(std::move(p)) {}
-Player::~Player() { setWriteItem(nullptr); setEditHouse(nullptr); }
-
-// Player method implementations
-Player::Player(ProtocolGame_ptr p) :
-	Creature(), lastPing(OTSYS_TIME()), lastPong(lastPing), client(std::move(p))
-{
-}
-
-Player::~Player()
-{
-	setWriteItem(nullptr);
-	setEditHouse(nullptr);
+	else if (!item->isPooled()) {
+		delete item;
+	}
 }
 
 std::string Player::getDescription(int32_t lookDistance) const
@@ -651,16 +635,16 @@ void Player::sendAddContainerItem(const Container* container, const Item* item)
 		return;
 	}
 	for (const auto& it : openContainers) {
-		if (auto lockedContainer = it.second.container.lock()) {
-			if (lockedContainer.get() != container) {
-				continue;
-			}
-			if (it.second.index >= container->capacity()) {
-				item = container->getItemByIndex(it.second.index);
-			}
-			if (item) {
-				client->sendAddContainerItem(it.first, item);
-			}
+		const OpenContainer& openContainer = it.second;
+		if (openContainer.container != container) {
+			continue;
+		}
+		const Item* itemToSend = item;
+		if (openContainer.index >= container->capacity()) {
+			itemToSend = container->getItemByIndex(openContainer.index);
+		}
+		if (itemToSend) {
+			client->sendAddContainerItem(it.first, itemToSend);
 		}
 	}
 }
@@ -963,26 +947,15 @@ Item* Player::getWriteItem(uint32_t& windowTextId, uint16_t& maxWriteLen)
 {
 	windowTextId = this->windowTextId;
 	maxWriteLen = this->maxWriteLen;
-	return writeItem;
+	return writeItem.get();
 }
 
 void Player::setWriteItem(Item* item, uint16_t maxWriteLen /*= 0*/)
 {
 	windowTextId++;
-
-	if (writeItem) {
-		writeItem->decrementReferenceCounter();
-	}
-
-	if (item) {
-		writeItem = item;
-		this->maxWriteLen = maxWriteLen;
-		writeItem->incrementReferenceCounter();
-	}
-	else {
-		writeItem = nullptr;
-		this->maxWriteLen = 0;
-	}
+	writeItem.reset(item ? itemPool.acquire(item->getID(), item->getItemCount()) : nullptr);
+	this->maxWriteLen = item ? maxWriteLen : 0;
+}
 }
 
 House* Player::getEditHouse(uint32_t& windowTextId, uint32_t& listId)
@@ -1118,13 +1091,8 @@ void Player::onCreatureAppear(Creature* creature, bool isLogin)
 {
 	Creature::onCreatureAppear(creature, isLogin);
 	if (isLogin && creature == this) {
-		for (int32_t slot = CONST_SLOT_FIRST; slot <= CONST_SLOT_LAST; ++slot) {
-			Item* item = inventory[slot].get();
-			if (item) {
-				item->startDecaying();
-				g_moveEvents->onPlayerEquip(this, item, static_cast<slots_t>(slot), false);
-			}
-		}
+	}
+}
 
 		for (Condition* condition : storedConditionList) {
 			addCondition(condition);
@@ -1287,7 +1255,9 @@ void Player::onRemoveCreature(Creature* creature, bool isLogout)
 
 void Player::openShopWindow(const std::list<ShopInfo>& shop)
 {
-	shopItemList = shop;
+	shopItemList.clear();
+	shopItemList.reserve(shop.size());
+	shopItemList.insert(shopItemList.end(), shop.begin(), shop.end());
 	sendShop();
 	sendSaleItemList();
 }
@@ -2147,12 +2117,10 @@ bool Player::dropCorpse(Creature* lastHitCreature, Creature* mostDamageCreature,
 
 Item* Player::getCorpse(Creature* lastHitCreature, Creature* mostDamageCreature)
 {
-	Item* corpse = Creature::getCorpse(lastHitCreature, mostDamageCreature);
-	if (corpse && corpse->getContainer()) {
-		std::unordered_map<std::string, uint16_t> names;
-		for (const auto& killer : getKillers()) {
-			++names[killer->getName()];
-		}
+	Item* corpse = itemPool.acquire(getLookCorpse(), 1);
+	corpse->setCorpseOwner(guid);
+	return corpse;
+}
 
 		if (lastHitCreature) {
 			if (!mostDamageCreature) {
@@ -3200,12 +3168,15 @@ void Player::internalAddThing(uint32_t index, Thing* thing)
 	if (!item || index > CONST_SLOT_LAST) {
 		return;
 	}
-
 	if (inventory[index]) {
-		// Stack or replace logic here (simplified)
 		if (inventory[index]->isStackable() && inventory[index]->getID() == item->getID()) {
 			inventory[index]->setItemCount(std::min<uint8_t>(100, inventory[index]->getItemCount() + item->getItemCount()));
-			itemPool.release(item); // Return to pool instead of deleting
+			itemPool.release(item);
+		}
+		else {
+			Item* oldItem = inventory[index].release();
+			inventory[index] = std::unique_ptr<Item>(itemPool.acquire(item->getID(), item->getItemCount()));
+			itemPool.release(oldItem);
 		}
 	}
 	else {
